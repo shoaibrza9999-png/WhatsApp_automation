@@ -1,1 +1,8 @@
-fastapi\nuvicorn\nsupabase\nlanggraph\nlangchain-groq\npython-dotenv\nrequests\napscheduler
+fastapi
+uvicorn
+supabase
+langgraph
+langchain-groq
+python-dotenv
+requests
+apscheduler
