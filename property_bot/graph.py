@@ -14,7 +14,7 @@ from whatsapp import send_whatsapp_text
 # Using "llama-3.1-70b-versatile" as approximation for Groq OSS 120b since 120b identifier may vary.
 # You requested gpt-oss-120b with disabled reasoning, adjust the model string as needed for your specific Groq access.
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-llm = ChatGroq(model_name="llama3-70b-8192", temperature=0, api_key=GROQ_API_KEY)
+llm = ChatGroq(model_name="meta-llama/llama-4-scout-17b-16e-instruct", temperature=0, api_key=GROQ_API_KEY)
 
 # --- Admin Graph ---
 admin_tools = [LogRent, LogPowerBill, UpdateMeter, EditTxn, GetGlobalHistory]
