@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+supabase
+langgraph
+langchain-groq
+python-dotenv
+requests
+apscheduler
