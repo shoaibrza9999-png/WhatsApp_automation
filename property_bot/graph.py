@@ -13,7 +13,7 @@ from db import get_tenant, get_power_rate, get_transaction, insert_transaction, 
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 # As requested, exact model name
-llm = ChatGroq(model_name="gpt-oss-120b", temperature=0, api_key=GROQ_API_KEY)
+llm = ChatGroq(model_name="openai/gpt-oss-120b", temperature=0, api_key=GROQ_API_KEY)
 
 admin_tools = [log_rent, updatemeter, logpowerbill, deletetransection, balance]
 admin_llm = llm.bind_tools(admin_tools)
