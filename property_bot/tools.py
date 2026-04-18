@@ -1,95 +1,91 @@
+import os
 from langchain_core.tools import tool
 from typing import Optional
-from db import log_transaction, edit_transaction, get_global_history, get_tenant_ledger
+from db import add_tenant as db_add_tenant
+from db import get_tenant_by_room, update_tenant_balances, log_transaction, archive_tenant
+from whatsapp import send_whatsapp_text
 
 @tool
-def LogRent(tenant_id: int, amount: float, note: str = "") -> str:
-    """Log a rent payment from a tenant. Returns a transaction ID.
+def add_tenant(house_no: str, room_no: str, name: str, phone_number: str, rent_amount: float, current_meter_reading: float, billing_cycle_date: int) -> str:
+    """Register a new tenant.
     Args:
-        tenant_id: The ID of the tenant.
-        amount: The amount of rent paid.
-        note: Optional note about the transaction.
+        house_no: The house number.
+        room_no: The room number.
+        name: Name of the tenant.
+        phone_number: Phone number of the tenant.
+        rent_amount: The monthly rent amount.
+        current_meter_reading: Current electricity meter reading.
+        billing_cycle_date: The day of the month rent is due (1-28).
     """
-    txn = log_transaction(tenant_id, "rent", amount, note)
-    if txn:
-        return f"Logged rent payment. Transaction ID: {txn.get('txn_id')}. Awaiting approval."
-    return "Failed to log rent payment."
-
-@tool
-def LogPowerBill(tenant_id: int, amount: float, note: str = "") -> str:
-    """Log an electricity/power bill payment.
-    Args:
-        tenant_id: The ID of the tenant.
-        amount: The amount paid for electricity.
-        note: Optional note.
-    """
-    txn = log_transaction(tenant_id, "electricity", amount, note)
-    if txn:
-        return f"Logged power bill payment. Transaction ID: {txn.get('txn_id')}. Awaiting approval."
-    return "Failed to log power bill payment."
-
-@tool
-def UpdateMeter(tenant_id: int, reading: float, note: str = "") -> str:
-    """Log a new electricity meter reading.
-    Args:
-        tenant_id: The ID of the tenant.
-        reading: The current meter reading.
-        note: Optional note.
-    """
-    txn = log_transaction(tenant_id, "meter_reading", reading, note)
-    if txn:
-        return f"Logged meter reading. Transaction ID: {txn.get('txn_id')}. Awaiting approval."
-    return "Failed to log meter reading."
-
-@tool
-def EditTxn(txn_id: int, new_amount: Optional[float] = None, new_note: Optional[str] = None) -> str:
-    """Edit an existing pending transaction.
-    Args:
-        txn_id: The ID of the transaction to edit.
-        new_amount: The new amount.
-        new_note: The new note.
-    """
-    updates = {}
-    if new_amount is not None:
-        updates["amount"] = new_amount
-    if new_note is not None:
-        updates["note"] = new_note
-
-    if not updates:
-        return "No updates provided."
-
-    success = edit_transaction(txn_id, updates)
+    success = db_add_tenant(house_no, room_no, name, phone_number, rent_amount, current_meter_reading, billing_cycle_date)
     if success:
-        return f"Transaction {txn_id} updated successfully."
-    return f"Failed to update transaction {txn_id}."
+        send_whatsapp_text(phone_number, f"Welcome! You have been registered in House {house_no}, Room {room_no} by the landlord.")
+        return "Tenant successfully added."
+    return "Failed to add tenant."
 
 @tool
-def GetGlobalHistory() -> str:
-    """Fetch the last 15 system-wide transactions with timestamps in IST. Useful for checking recent payments."""
-    history = get_global_history(15)
-    if not history:
-        return "No recent transactions found."
-
-    result = []
-    for h in history:
-        tenant_name = h.get("tenants", {}).get("name", "Unknown")
-        room_id = h.get("tenants", {}).get("room", {}).get("room_id", "Unknown")
-        ts = h.get("timestamp")
-        # Could parse and format to IST, keeping raw for now
-        result.append(f"Txn {h.get('txn_id')}: {h.get('type')} of {h.get('amount')} by {tenant_name} (Room {room_id}) on {ts} [{h.get('status')}]")
-
-    return "\n".join(result)
+def electricity_increase(house_no: str, room_no: str, current_unit: float) -> str:
+    """Charge a tenant for electricity based on the current meter reading. Requires HITL.
+    Args:
+        house_no: The house number.
+        room_no: The room number.
+        current_unit: The current meter reading.
+    """
+    # This tool merely sets up the intent and returns a string indicating HITL is needed.
+    # The actual execution happens in the HITL confirmation node in graph.py.
+    return f"PENDING_CONFIRMATION: electricity_increase | {house_no} | {room_no} | {current_unit}"
 
 @tool
-def GetMyLedger(tenant_id: int) -> str:
-    """Fetch the last 7-8 transactions for the requesting tenant. Use this to explain their balance."""
-    ledger = get_tenant_ledger(tenant_id, 8)
-    if not ledger:
-        return "No transactions found for your account."
+def fill_rent(house_no: str, room_no: str, amount: float) -> str:
+    """Record a rent payment from a tenant.
+    Args:
+        house_no: The house number.
+        room_no: The room number.
+        amount: The amount of rent paid.
+    """
+    tenant = get_tenant_by_room(house_no, room_no)
+    if not tenant:
+        return "Tenant not found."
 
-    result = []
-    for h in ledger:
-        ts = h.get("timestamp")
-        result.append(f"Txn {h.get('txn_id')}: {h.get('type')} of {h.get('amount')} on {ts} [{h.get('status')}]")
+    tenant_id = tenant["id"]
+    current_balance = tenant.get("rent_balance", 0)
+    new_balance = current_balance - amount
 
-    return "\n".join(result)
+    update_tenant_balances(tenant_id, {"rent_balance": new_balance})
+    log_transaction(tenant_id, "RENT_PAYMENT", amount, "Rent payment received")
+
+    send_whatsapp_text(tenant["phone_number"], f"We have received your rent payment of Rs{amount}. Thank you!")
+    return f"Rent payment of {amount} processed for House {house_no}, Room {room_no}."
+
+@tool
+def fill_electricity(house_no: str, room_no: str, amount: float) -> str:
+    """Record an electricity payment from a tenant.
+    Args:
+        house_no: The house number.
+        room_no: The room number.
+        amount: The amount of electricity paid.
+    """
+    tenant = get_tenant_by_room(house_no, room_no)
+    if not tenant:
+        return "Tenant not found."
+
+    tenant_id = tenant["id"]
+    current_balance = tenant.get("electricity_balance", 0)
+    new_balance = current_balance - amount
+
+    update_tenant_balances(tenant_id, {"electricity_balance": new_balance})
+    log_transaction(tenant_id, "ELEC_PAYMENT", amount, "Electricity payment received")
+
+    send_whatsapp_text(tenant["phone_number"], f"Electricity payment of Rs{amount} received. Thank you!")
+    return f"Electricity payment of {amount} processed for House {house_no}, Room {room_no}."
+
+@tool
+def remove_tenant(house_no: str, room_no: str) -> str:
+    """Remove a tenant from the system. Requires HITL.
+    Args:
+        house_no: The house number.
+        room_no: The room number.
+    """
+    # Requires HITL confirmation before archiving
+    return f"PENDING_CONFIRMATION: remove_tenant | {house_no} | {room_no}"
+

@@ -1,283 +1,124 @@
 import os
-import psycopg2
-from psycopg2.extras import RealDictCursor
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 from typing import Dict, Any, List, Optional
+from supabase import create_client, Client
 
 load_dotenv()
 
-# Setup Neon Postgres client
-DATABASE_URL: str = os.environ.get("DATABASE_URL", "postgresql://neondb_owner:npg_ZlDvyOwNXx60@ep-cold-band-am40hnph-pooler.c-5.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require")
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 
-def get_connection():
-    try:
-        conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
-        conn.autocommit = True
-        return conn
-    except Exception as e:
-        print(f"Database connection error: {e}")
-        return None
+# Initialize Supabase client
+if SUPABASE_URL and SUPABASE_KEY:
+    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+else:
+    supabase = None
 
 def init_db():
-    conn = get_connection()
-    if not conn:
-        return
-    try:
-        with conn.cursor() as cur:
-            # Create tables if they don't exist
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS rooms (
-                    room_id SERIAL PRIMARY KEY,
-                    house_id INT,
-                    base_rent NUMERIC,
-                    active_tenant_id INT
-                );
-
-                CREATE TABLE IF NOT EXISTS tenants (
-                    tenant_id SERIAL PRIMARY KEY,
-                    name VARCHAR(255),
-                    phone_number VARCHAR(50),
-                    is_active BOOLEAN DEFAULT TRUE
-                );
-
-                CREATE TABLE IF NOT EXISTS transactions (
-                    txn_id SERIAL PRIMARY KEY,
-                    tenant_id INT,
-                    type VARCHAR(50),
-                    amount NUMERIC,
-                    note TEXT,
-                    timestamp TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-                    status VARCHAR(50) DEFAULT 'pending_approval'
-                );
-
-                CREATE TABLE IF NOT EXISTS system_settings (
-                    setting_name VARCHAR(100) PRIMARY KEY,
-                    value VARCHAR(255)
-                );
-            """)
-    except Exception as e:
-        print(f"Error initializing DB: {e}")
-    finally:
-        conn.close()
-
-# Initialize DB structure
-init_db()
+    # Since Supabase python client doesn't support raw SQL execution easily without RPC,
+    # the tables are typically created via the Supabase dashboard or migrations.
+    # We will assume they exist based on schema.sql provided.
+    pass
 
 def get_tenant_by_phone(phone_number: str) -> Optional[Dict[str, Any]]:
-    conn = get_connection()
-    if not conn: return None
+    if not supabase: return None
     try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT * FROM tenants WHERE phone_number = %s AND is_active = TRUE", (phone_number,))
-            res = cur.fetchone()
-            return dict(res) if res else None
+        response = supabase.table("tenants").select("*").eq("phone_number", phone_number).eq("is_active", True).execute()
+        return response.data[0] if response.data else None
     except Exception as e:
-        print(f"Error fetching tenant: {e}")
+        print(f"Error fetching tenant by phone: {e}")
         return None
-    finally:
-        conn.close()
 
-def get_empty_rooms() -> List[Dict[str, Any]]:
-    conn = get_connection()
-    if not conn: return []
+def get_tenant_by_room(house_no: str, room_no: str) -> Optional[Dict[str, Any]]:
+    if not supabase: return None
     try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT * FROM rooms WHERE active_tenant_id IS NULL")
-            res = cur.fetchall()
-            return [dict(r) for r in res]
+        # First get house id
+        house_resp = supabase.table("houses").select("id").eq("house_no", house_no).execute()
+        if not house_resp.data:
+            return None
+        house_id = house_resp.data[0]["id"]
+
+        response = supabase.table("tenants").select("*").eq("house_id", house_id).eq("room_no", room_no).eq("is_active", True).execute()
+        return response.data[0] if response.data else None
     except Exception as e:
-        print(f"Error fetching empty rooms: {e}")
-        return []
-    finally:
-        conn.close()
+        print(f"Error fetching tenant by room: {e}")
+        return None
 
-def add_tenant(room_id: int, name: str, phone_number: str) -> bool:
-    conn = get_connection()
-    if not conn: return False
+def add_tenant(house_no: str, room_no: str, name: str, phone_number: str, rent_amount: float, current_meter_reading: float, billing_cycle_date: int) -> bool:
+    if not supabase: return False
     try:
-        with conn.cursor() as cur:
-            cur.execute("INSERT INTO tenants (name, phone_number, is_active) VALUES (%s, %s, TRUE) RETURNING tenant_id", (name, phone_number))
-            tenant_id = cur.fetchone()['tenant_id']
-            cur.execute("UPDATE rooms SET active_tenant_id = %s WHERE room_id = %s", (tenant_id, room_id))
-            return True
+        # Get or create house
+        house_resp = supabase.table("houses").select("id").eq("house_no", house_no).execute()
+        if house_resp.data:
+            house_id = house_resp.data[0]["id"]
+        else:
+            new_house = supabase.table("houses").insert({"house_no": house_no}).execute()
+            house_id = new_house.data[0]["id"]
+
+        data = {
+            "house_id": house_id,
+            "room_no": room_no,
+            "name": name,
+            "phone_number": phone_number,
+            "rent_amount": rent_amount,
+            "last_meter_reading": current_meter_reading,
+            "billing_cycle_date": billing_cycle_date,
+            "is_active": True
+        }
+        supabase.table("tenants").insert(data).execute()
+        return True
     except Exception as e:
         print(f"Error adding tenant: {e}")
         return False
-    finally:
-        conn.close()
 
-def archive_tenant(room_id: int) -> bool:
-    conn = get_connection()
-    if not conn: return False
+def update_tenant_balances(tenant_id: str, updates: Dict[str, Any]) -> bool:
+    if not supabase: return False
     try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT active_tenant_id FROM rooms WHERE room_id = %s", (room_id,))
-            res = cur.fetchone()
-            if not res or not res['active_tenant_id']:
-                return False
-            tenant_id = res['active_tenant_id']
+        supabase.table("tenants").update(updates).eq("id", tenant_id).execute()
+        return True
+    except Exception as e:
+        print(f"Error updating tenant balances: {e}")
+        return False
 
-            cur.execute("UPDATE tenants SET is_active = FALSE WHERE tenant_id = %s", (tenant_id,))
-            cur.execute("UPDATE rooms SET active_tenant_id = NULL WHERE room_id = %s", (room_id,))
-            return True
+def archive_tenant(tenant_id: str) -> bool:
+    if not supabase: return False
+    try:
+        supabase.table("tenants").update({"is_active": False}).eq("id", tenant_id).execute()
+        return True
     except Exception as e:
         print(f"Error archiving tenant: {e}")
         return False
-    finally:
-        conn.close()
 
-def update_system_setting(setting_name: str, value: Any) -> bool:
-    conn = get_connection()
-    if not conn: return False
+def log_transaction(tenant_id: str, txn_type: str, amount: float, description: str) -> Optional[str]:
+    if not supabase: return None
     try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO system_settings (setting_name, value)
-                VALUES (%s, %s)
-                ON CONFLICT (setting_name)
-                DO UPDATE SET value = EXCLUDED.value
-            """, (setting_name, str(value)))
-            return True
-    except Exception as e:
-        print(f"Error updating system setting: {e}")
-        return False
-    finally:
-        conn.close()
-
-def get_system_setting(setting_name: str) -> Any:
-    conn = get_connection()
-    if not conn: return None
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT value FROM system_settings WHERE setting_name = %s", (setting_name,))
-            res = cur.fetchone()
-            return res['value'] if res else None
-    except Exception as e:
-        return None
-    finally:
-        conn.close()
-
-def update_room_rent(room_id: int, base_rent: float) -> bool:
-    conn = get_connection()
-    if not conn: return False
-    try:
-        with conn.cursor() as cur:
-            cur.execute("UPDATE rooms SET base_rent = %s WHERE room_id = %s", (base_rent, room_id))
-            return True
-    except Exception as e:
-        print(f"Error updating room rent: {e}")
-        return False
-    finally:
-        conn.close()
-
-def log_transaction(tenant_id: int, txn_type: str, amount: float, note: str, status: str = "pending_approval") -> Dict[str, Any]:
-    conn = get_connection()
-    if not conn: return {}
-    try:
-        with conn.cursor() as cur:
-            ts = datetime.now(timezone.utc).isoformat()
-            cur.execute("""
-                INSERT INTO transactions (tenant_id, type, amount, note, timestamp, status)
-                VALUES (%s, %s, %s, %s, %s, %s) RETURNING txn_id
-            """, (tenant_id, txn_type, amount, note, ts, status))
-            txn_id = cur.fetchone()['txn_id']
-            return {"txn_id": txn_id, "status": status}
+        data = {
+            "tenant_id": tenant_id,
+            "transaction_type": txn_type,
+            "amount": amount,
+            "description": description
+        }
+        resp = supabase.table("transactions").insert(data).execute()
+        return resp.data[0]["id"] if resp.data else None
     except Exception as e:
         print(f"Error logging transaction: {e}")
-        return {}
-    finally:
-        conn.close()
+        return None
 
-def edit_transaction(txn_id: int, updates: Dict[str, Any]) -> bool:
-    conn = get_connection()
-    if not conn: return False
-    if not updates: return False
+def get_tenant_ledger(tenant_id: str, limit: int = 20) -> List[Dict[str, Any]]:
+    if not supabase: return []
     try:
-        with conn.cursor() as cur:
-            set_clause = ", ".join([f"{k} = %s" for k in updates.keys()])
-            values = list(updates.values())
-            values.append(txn_id)
-            cur.execute(f"UPDATE transactions SET {set_clause} WHERE txn_id = %s", tuple(values))
-            return True
-    except Exception as e:
-        print(f"Error editing transaction: {e}")
-        return False
-    finally:
-        conn.close()
-
-def get_global_history(limit: int = 15) -> List[Dict[str, Any]]:
-    conn = get_connection()
-    if not conn: return []
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT t.*, tn.name as tenant_name, r.room_id
-                FROM transactions t
-                LEFT JOIN tenants tn ON t.tenant_id = tn.tenant_id
-                LEFT JOIN rooms r ON tn.tenant_id = r.active_tenant_id
-                ORDER BY t.timestamp DESC LIMIT %s
-            """, (limit,))
-            res = cur.fetchall()
-
-            # format to match previous output shape
-            formatted = []
-            for r in res:
-                d = dict(r)
-                d['tenants'] = {
-                    'name': d.get('tenant_name'),
-                    'room': {'room_id': d.get('room_id')}
-                }
-                formatted.append(d)
-            return formatted
-    except Exception as e:
-        print(f"Error fetching global history: {e}")
-        return []
-    finally:
-        conn.close()
-
-def get_tenant_ledger(tenant_id: int, limit: int = 8) -> List[Dict[str, Any]]:
-    conn = get_connection()
-    if not conn: return []
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT * FROM transactions WHERE tenant_id = %s ORDER BY timestamp DESC LIMIT %s", (tenant_id, limit))
-            res = cur.fetchall()
-            return [dict(r) for r in res]
+        resp = supabase.table("transactions").select("*").eq("tenant_id", tenant_id).order("created_at", desc=True).limit(limit).execute()
+        return resp.data
     except Exception as e:
         print(f"Error fetching tenant ledger: {e}")
         return []
-    finally:
-        conn.close()
 
-def get_tenants_needing_reminders() -> List[Dict[str, Any]]:
-    conn = get_connection()
-    if not conn: return []
+def get_tenants_needing_reminders(today_date: int) -> List[Dict[str, Any]]:
+    if not supabase: return []
     try:
-        with conn.cursor() as cur:
-            now = datetime.now(timezone.utc)
-            start_of_month = datetime(now.year, now.month, 1, tzinfo=timezone.utc).isoformat()
-
-            cur.execute("""
-                SELECT t.*, r.base_rent
-                FROM tenants t
-                LEFT JOIN rooms r ON t.tenant_id = r.active_tenant_id
-                WHERE t.is_active = TRUE AND t.tenant_id NOT IN (
-                    SELECT tenant_id FROM transactions
-                    WHERE type = 'rent' AND status = 'completed' AND timestamp >= %s
-                )
-            """, (start_of_month,))
-
-            res = cur.fetchall()
-
-            formatted = []
-            for r in res:
-                d = dict(r)
-                d['rooms'] = {'base_rent': d.get('base_rent')}
-                formatted.append(d)
-            return formatted
+        resp = supabase.table("tenants").select("*").eq("is_active", True).eq("billing_cycle_date", today_date).execute()
+        return resp.data
     except Exception as e:
         print(f"Error fetching reminder tenants: {e}")
         return []
-    finally:
-        conn.close()

@@ -6,3 +6,5 @@ python-dotenv
 requests
 apscheduler
 psycopg2-binary
+supabase
+langgraph-checkpoint-sqlite
