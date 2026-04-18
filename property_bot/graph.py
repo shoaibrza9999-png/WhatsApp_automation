@@ -7,6 +7,8 @@ from langgraph.graph import StateGraph, START, END, MessagesState
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
 from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.sqlite import SqliteSaver
+import sqlite3
 
 from tools import add_tenant, electricity_increase, fill_rent, fill_electricity, remove_tenant
 from db import get_tenant_by_room, update_tenant_balances, log_transaction, archive_tenant
@@ -161,6 +163,7 @@ def process_confirmation(state: AgentState):
             summary = f"Your tenancy has ended. Final balances - Rent: {data['rent_balance']}, Electricity: {data['electricity_balance']}"
             send_whatsapp_text(data["phone_number"], summary)
 
+
             new_messages.append(ToolMessage(content="Tenant successfully removed.", tool_call_id=data["tool_call_id"]))
             send_whatsapp_text(state["sender_id"], "Confirmed. Tenant removed.")
 
@@ -170,7 +173,16 @@ def process_confirmation(state: AgentState):
             new_messages.append(ToolMessage(content="Action cancelled by user.", tool_call_id=data["tool_call_id"]))
         send_whatsapp_text(state["sender_id"], "Action cancelled.")
 
+    # FIX: Ensure all tool calls have a corresponding ToolMessage
+    last_message = state["messages"][-2] if len(state["messages"]) >= 2 else None
+    if getattr(last_message, 'tool_calls', None):
+        handled_tool_ids = [m.tool_call_id for m in new_messages if isinstance(m, ToolMessage)]
+        for tc in last_message.tool_calls:
+            if tc["id"] not in handled_tool_ids:
+                new_messages.append(ToolMessage(content="Tool execution aborted or failed to find tenant.", tool_call_id=tc["id"]))
+
     return {"messages": new_messages, "pending_tool_call": {}}
+
 
 # Build Graph
 workflow = StateGraph(AgentState)
@@ -185,7 +197,8 @@ workflow.add_edge("tools", "agent")
 workflow.add_edge("ask_confirmation", "process_confirmation")  # Edge added
 workflow.add_edge("process_confirmation", "agent")
 
-memory = MemorySaver()
+conn = sqlite3.connect('checkpoints.sqlite', check_same_thread=False)
+memory = SqliteSaver(conn)
 # Interrupt before processing the confirmation to wait for human input
 admin_graph = workflow.compile(checkpointer=memory, interrupt_before=["process_confirmation"])
 
