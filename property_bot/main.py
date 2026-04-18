@@ -1,17 +1,17 @@
 import os
 import io
 import asyncio
+import re
 import requests
 from fastapi import FastAPI, Request, BackgroundTasks, HTTPException
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
-from db import get_tenant_by_phone, get_tenants_needing_reminders
-from commands import handle_command
-from graph import run_admin_agent, run_tenant_agent
-from hf_client import process_audio, process_image
+from db import get_tenants_needing_reminders, update_tenant_balances, log_transaction, supabase
+from graph import run_admin_agent
 from whatsapp import send_whatsapp_text
 
 load_dotenv()
@@ -19,27 +19,37 @@ load_dotenv()
 ADMIN_NUMBER = os.environ.get("ADMIN_WHATSAPP_NUMBER", "")
 WHATSAPP_VERIFY_TOKEN = os.environ.get("WHATSAPP_VERIFY_TOKEN", "my_custom_verify_token")
 
-# Setup Scheduler for Cron Jobs
 scheduler = AsyncIOScheduler()
 
 async def reminder_cron_job():
-    """Runs on the 5th of every month at 10:00 AM IST to send rent reminders."""
-    print("Running monthly reminder cron job...")
-    tenants = get_tenants_needing_reminders()
-    for t in tenants:
-        phone = t.get("phone_number")
-        name = t.get("name")
-        rent = t.get("rooms", {}).get("base_rent", "Unknown")
+    """Runs daily to check if rent is due for active tenants."""
+    print("Running daily cron job for rent charges...")
+    today_date = datetime.now(timezone.utc).day
 
-        msg = f"Hello {name}, this is a gentle reminder that your rent for this month (Base: {rent}) is due. Please clear the dues at your earliest convenience."
+    tenants = get_tenants_needing_reminders(today_date)
+    for t in tenants:
+        tenant_id = t["id"]
+        phone = t.get("phone_number")
+        rent_amount = t.get("rent_amount", 0)
+        current_balance = t.get("rent_balance", 0)
+
+        # 1. Update rent balance
+        new_balance = current_balance + rent_amount
+        update_tenant_balances(tenant_id, {"rent_balance": new_balance})
+
+        # 2. Insert transaction
+        log_transaction(tenant_id, "RENT_CHARGE", rent_amount, "Monthly Rent")
+
+        # 3. Send message
+        msg = f"Monthly Rent reminder: Your rent of {rent_amount} has been generated."
         if phone:
             send_whatsapp_text(phone, msg)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Setup cron job on startup
-    # 10:00 AM IST is 04:30 AM UTC
-    trigger = CronTrigger(day="5", hour="4", minute="30")
+    # Run daily at 00:00 UTC
+    trigger = CronTrigger(hour="0", minute="0")
     scheduler.add_job(reminder_cron_job, trigger)
     scheduler.start()
     yield
@@ -71,7 +81,6 @@ async def handle_webhook(request: Request, background_tasks: BackgroundTasks):
     data = await request.json()
 
     try:
-        # Extract message data from standard WhatsApp webhook payload
         entry = data.get("entry", [])[0]
         changes = entry.get("changes", [])[0]
         value = changes.get("value", {})
@@ -84,46 +93,62 @@ async def handle_webhook(request: Request, background_tasks: BackgroundTasks):
         sender_id = message.get("from")
         msg_type = message.get("type")
 
-        if msg_type not in ["text", "audio", "image"]:
+        # 1. Check if it's the Owner
+        # Normalize ADMIN_NUMBER
+        admin_num = ADMIN_NUMBER.replace("+", "")
+        if sender_id != admin_num:
             return {"status": "ignored"}
 
-        # Determine text content based on message type
+        if msg_type not in ["text", "interactive"]:
+            return {"status": "ignored"}
+
         text = ""
         if msg_type == "text":
             text = message.get("text", {}).get("body", "")
-        elif msg_type == "audio":
-            # In real implementation: download media using media_id, pass to HF Whisper
-            # media_id = message.get("audio", {}).get("id")
-            # audio_bytes = download_whatsapp_media(media_id)
-            # text = await process_audio(audio_bytes)
-            text = "Simulated transcribed audio text"
-        elif msg_type == "image":
-            # media_id = message.get("image", {}).get("id")
-            # image_bytes = download_whatsapp_media(media_id)
-            # caption = message.get("image", {}).get("caption", "Extract details")
-            # text = await process_image(image_bytes, caption)
-            text = "Simulated extracted image text"
+        elif msg_type == "interactive":
+            interactive = message.get("interactive", {})
+            if interactive.get("type") == "button_reply":
+                text = interactive.get("button_reply", {}).get("id", "") # Assuming ID holds the answer like 'yes'
 
-        # 1. Routing: Check if Hardcoded Command
-        if handle_command(sender_id, text):
-            return {"status": "ok"}
-
-        # Thread ID for memory (one per user)
         thread_id = f"thread_{sender_id}"
 
-        # 2. Routing: Role-Based Access Control
-        if sender_id == ADMIN_NUMBER or sender_id == ADMIN_NUMBER.replace("+", ""):
-            # Route to Admin Agent
-            background_tasks.add_task(run_admin_agent, sender_id, text, thread_id)
-        else:
-            # Route to Tenant Agent
-            tenant = get_tenant_by_phone(sender_id)
-            if tenant:
-                tenant_id = tenant["tenant_id"]
-                background_tasks.add_task(run_tenant_agent, sender_id, tenant_id, text, thread_id)
-            else:
-                # Unknown user
-                send_whatsapp_text(sender_id, "Sorry, I don't recognize this number. Please contact the administrator.")
+        # Context Injection
+        tenant_context = ""
+        # Check if text mentions house and room
+        house_match = re.search(r'house\s*(\S+)', text, re.IGNORECASE)
+        room_match = re.search(r'room\s*(\S+)', text, re.IGNORECASE)
+
+        if house_match and room_match:
+            house_no = house_match.group(1)
+            room_no = room_match.group(1)
+
+            # Fetch tenant id
+            try:
+                house_resp = supabase.table("houses").select("id").eq("house_no", house_no).execute()
+                if house_resp.data:
+                    house_id = house_resp.data[0]["id"]
+                    tenant_resp = supabase.table("tenants").select("id").eq("house_id", house_id).eq("room_no", room_no).execute()
+                    if tenant_resp.data:
+                        tenant_id = tenant_resp.data[0]["id"]
+
+                        # Query transactions
+                        txns_resp = supabase.table("transactions").select("created_at, transaction_type, amount, description").eq("tenant_id", tenant_id).order("created_at", desc=True).limit(20).execute()
+
+                        if txns_resp.data:
+                            tenant_context = f"### Recent Transactions for House {house_no}, Room {room_no}\n"
+                            tenant_context += "| Date | Type | Amount | Description |\n"
+                            tenant_context += "| :--- | :--- | :--- | :--- |\n"
+                            for txn in txns_resp.data:
+                                date = txn.get("created_at", "")[:10]
+                                txn_type = txn.get("transaction_type", "")
+                                amt = txn.get("amount", 0)
+                                desc = txn.get("description", "")
+                                tenant_context += f"| {date} | {txn_type} | {amt:.2f} | {desc} |\n"
+            except Exception as e:
+                print(f"Error injecting context: {e}")
+
+        # Route to Admin Agent
+        background_tasks.add_task(run_admin_agent, sender_id, text, thread_id, tenant_context)
 
         return {"status": "ok"}
 

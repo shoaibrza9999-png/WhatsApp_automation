@@ -1,174 +1,226 @@
 import os
 import json
-from typing import Annotated, Literal, TypedDict, Dict, Any
+from typing import Annotated, Literal, TypedDict, Dict, Any, Sequence
 from langchain_groq import ChatGroq
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, ToolMessage
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, ToolMessage, BaseMessage
 from langgraph.graph import StateGraph, START, END, MessagesState
+from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
 from langgraph.checkpoint.memory import MemorySaver
 
-from tools import LogRent, LogPowerBill, UpdateMeter, EditTxn, GetGlobalHistory, GetMyLedger
+from tools import add_tenant, electricity_increase, fill_rent, fill_electricity, remove_tenant
+from db import get_tenant_by_room, update_tenant_balances, log_transaction, archive_tenant
 from whatsapp import send_whatsapp_text
 
-# Configure LLM
-# Using "llama-3.1-70b-versatile" as approximation for Groq OSS 120b since 120b identifier may vary.
-# You requested gpt-oss-120b with disabled reasoning, adjust the model string as needed for your specific Groq access.
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-llm = ChatGroq(model_name="meta-llama/llama-4-scout-17b-16e-instruct", temperature=0, api_key=GROQ_API_KEY)
+llm = ChatGroq(model_name="llama-3.3-70b-versatile", temperature=0, api_key=GROQ_API_KEY)
 
-# --- Admin Graph ---
-admin_tools = [LogRent, LogPowerBill, UpdateMeter, EditTxn, GetGlobalHistory]
-admin_llm = llm.bind_tools(admin_tools)
+tools = [add_tenant, electricity_increase, fill_rent, fill_electricity, remove_tenant]
+llm_with_tools = llm.bind_tools(tools)
 
-class AgentState(MessagesState):
+class AgentState(TypedDict):
+    messages: Annotated[Sequence[BaseMessage], add_messages]
+    pending_tool_call: Dict[str, Any]
+    tenant_context: str
     sender_id: str
-    tenant_id: int
 
-def admin_agent_node(state: AgentState):
+def agent_node(state: AgentState):
     messages = state["messages"]
-    system_prompt = SystemMessage(content="You are a helpful property management assistant for the admin. Your job is to clarify missing data and use tools to log transactions or answer queries.")
+    tenant_context = state.get("tenant_context", "")
 
-    # We only send the last 70 messages to Groq as requested
-    msg_history = [system_prompt] + messages[-70:]
-    response = admin_llm.invoke(msg_history)
+    system_prompt = f"""You are 'PropManage AI', an elite property management assistant communicating exclusively with the Property Owner.
+Your job is to parse the Owner's commands,
+
+TONE & BEHAVIOR:
+- Concise, subservient, and highly accurate.
+- If the Owner provides incomplete data (e.g., "Add 500 to room 2" but doesn't specify which house or if it's rent/electricity), you MUST ask the Owner for clarification before calling a tool.
+
+TRANSACTION HISTORY CONTEXT:
+If the Owner asks about a tenant's status, use the provided transaction history markdown table to answer them.
+[System Note: Backend will inject the markdown table here dynamically based on the active conversation context]
+{tenant_context}
+"""
+
+    msg_history = [SystemMessage(content=system_prompt)] + list(messages)
+    response = llm_with_tools.invoke(msg_history)
     return {"messages": [response]}
 
-def should_continue_admin(state: AgentState) -> Literal["tools", "human_review", END]:
+def should_continue(state: AgentState) -> Literal["tools", "ask_confirmation", END]:
     messages = state["messages"]
     last_message = messages[-1]
 
-    if last_message.tool_calls:
-        # If the tool call modifies state (not GetGlobalHistory), we might want HITL
-        # For simplicity, we interrupt before ANY tool execution in this example, or selectively:
-        modifying_tools = {"LogRent", "LogPowerBill", "UpdateMeter", "EditTxn"}
+    if getattr(last_message, 'tool_calls', None):
         for tc in last_message.tool_calls:
-            if tc["name"] in modifying_tools:
-                return "human_review"
+            if tc["name"] in ["electricity_increase", "remove_tenant"]:
+                return "ask_confirmation"
         return "tools"
     return END
 
-def execute_tools_node(state: AgentState):
-    """Execute tools (bypassing HITL, e.g., for read-only tools)."""
-    tool_node = ToolNode(admin_tools)
+def tools_node(state: AgentState):
+    tool_node = ToolNode(tools)
     return tool_node.invoke(state)
 
-def ask_human_approval(state: AgentState):
-    """
-    This node simply pauses the graph using the built-in LangGraph interrupt mechanism.
-    Before returning, it would realistically send a WhatsApp message to the admin.
-    """
+def ask_confirmation_node(state: AgentState):
     last_message = state["messages"][-1]
-    sender_id = state.get("sender_id")
+    sender_id = state.get("sender_id", "")
 
-    # Send a message to admin (or dashboard) about pending tool call
-    tool_calls_str = json.dumps(last_message.tool_calls, indent=2)
-    send_whatsapp_text(sender_id, f"PENDING APPROVAL: I'm about to execute the following actions:\n{tool_calls_str}\n\nRespond with 'approve' to proceed.")
+    pending_calls = {}
+    for tc in last_message.tool_calls:
+        if tc["name"] == "electricity_increase":
+            args = tc["args"]
+            house_no = args.get("house_no")
+            room_no = args.get("room_no")
+            current_unit = float(args.get("current_unit", 0))
 
-    # LangGraph will pause here until state is updated externally
-    return state
+            tenant = get_tenant_by_room(house_no, room_no)
+            if tenant:
+                last_reading = float(tenant.get("last_meter_reading", 0))
+                units_consumed = current_unit - last_reading
+                amount_due = units_consumed * 7
 
-# Build Admin Graph
-admin_workflow = StateGraph(AgentState)
-admin_workflow.add_node("agent", admin_agent_node)
-admin_workflow.add_node("human_review", ask_human_approval)
-admin_workflow.add_node("tools", ToolNode(admin_tools))
+                msg = f"You are about to charge House {house_no} Room {room_no} for Rs{amount_due} ( {units_consumed} units). Reply YES to confirm or NO to cancel."
+                send_whatsapp_text(sender_id, msg)
 
-admin_workflow.add_edge(START, "agent")
-admin_workflow.add_conditional_edges("agent", should_continue_admin)
-admin_workflow.add_edge("human_review", "tools") # After approval, proceed to tools
-admin_workflow.add_edge("tools", "agent")
+                pending_calls["electricity_increase"] = {
+                    "tool_call_id": tc["id"],
+                    "tenant_id": tenant["id"],
+                    "phone_number": tenant["phone_number"],
+                    "amount_due": amount_due,
+                    "units_consumed": units_consumed,
+                    "current_unit": current_unit
+                }
+            else:
+                send_whatsapp_text(sender_id, f"Could not find tenant in House {house_no} Room {room_no}.")
 
-# Use MemorySaver for checkpointing state (necessary for HITL interrupts)
+        elif tc["name"] == "remove_tenant":
+            args = tc["args"]
+            house_no = args.get("house_no")
+            room_no = args.get("room_no")
+
+            tenant = get_tenant_by_room(house_no, room_no)
+            if tenant:
+                rent_bal = tenant.get("rent_balance", 0)
+                elec_bal = tenant.get("electricity_balance", 0)
+                msg = f"You are about to remove tenant from House {house_no} Room {room_no}. Balances - Rent: {rent_bal}, Elec: {elec_bal}. Reply YES to confirm or NO to cancel."
+                send_whatsapp_text(sender_id, msg)
+
+                pending_calls["remove_tenant"] = {
+                    "tool_call_id": tc["id"],
+                    "tenant_id": tenant["id"],
+                    "phone_number": tenant["phone_number"],
+                    "rent_balance": rent_bal,
+                    "electricity_balance": elec_bal
+                }
+            else:
+                send_whatsapp_text(sender_id, f"Could not find tenant in House {house_no} Room {room_no}.")
+
+    return {"pending_tool_call": pending_calls}
+
+def process_confirmation(state: AgentState):
+    """Called after HITL interrupt if user replies YES/NO."""
+    pending = state.get("pending_tool_call", {})
+    messages = list(state["messages"])
+
+    last_human_msg = next((m for m in reversed(messages) if isinstance(m, HumanMessage)), None)
+    if not last_human_msg:
+        return state
+
+    reply = last_human_msg.content.strip().lower()
+
+    new_messages = []
+
+    if reply == "yes":
+        if "electricity_increase" in pending:
+            data = pending["electricity_increase"]
+            tenant_id = data["tenant_id"]
+            amount_due = data["amount_due"]
+            units = data["units_consumed"]
+            current_unit = data["current_unit"]
+
+            # Update DB
+            import db
+            t = db.supabase.table("tenants").select("electricity_balance").eq("id", tenant_id).execute()
+            if t.data:
+                curr_bal = float(t.data[0].get("electricity_balance", 0))
+                db.supabase.table("tenants").update({
+                    "electricity_balance": curr_bal + amount_due,
+                    "last_meter_reading": current_unit
+                }).eq("id", tenant_id).execute()
+
+            log_transaction(tenant_id, "ELEC_CHARGE", amount_due, f"Meter reading updated. {units} units consumed.")
+            send_whatsapp_text(data["phone_number"], f"Your new electricity bill is Rs{amount_due} for {units} units.")
+
+            new_messages.append(ToolMessage(content=f"Successfully charged {amount_due} for {units} units.", tool_call_id=data["tool_call_id"]))
+            send_whatsapp_text(state["sender_id"], f"Confirmed. Charged Rs{amount_due}.")
+
+        elif "remove_tenant" in pending:
+            data = pending["remove_tenant"]
+            tenant_id = data["tenant_id"]
+            archive_tenant(tenant_id)
+
+            summary = f"Your tenancy has ended. Final balances - Rent: {data['rent_balance']}, Electricity: {data['electricity_balance']}"
+            send_whatsapp_text(data["phone_number"], summary)
+
+            new_messages.append(ToolMessage(content="Tenant successfully removed.", tool_call_id=data["tool_call_id"]))
+            send_whatsapp_text(state["sender_id"], "Confirmed. Tenant removed.")
+
+    else:
+        # Cancelled
+        for key, data in pending.items():
+            new_messages.append(ToolMessage(content="Action cancelled by user.", tool_call_id=data["tool_call_id"]))
+        send_whatsapp_text(state["sender_id"], "Action cancelled.")
+
+    return {"messages": new_messages, "pending_tool_call": {}}
+
+# Build Graph
+workflow = StateGraph(AgentState)
+workflow.add_node("agent", agent_node)
+workflow.add_node("tools", tools_node)
+workflow.add_node("ask_confirmation", ask_confirmation_node)
+workflow.add_node("process_confirmation", process_confirmation)
+
+workflow.add_edge(START, "agent")
+workflow.add_conditional_edges("agent", should_continue)
+workflow.add_edge("tools", "agent")
+workflow.add_edge("ask_confirmation", "process_confirmation")  # Edge added
+workflow.add_edge("process_confirmation", "agent")
+
 memory = MemorySaver()
-admin_graph = admin_workflow.compile(checkpointer=memory, interrupt_before=["tools"])
+# Interrupt before processing the confirmation to wait for human input
+admin_graph = workflow.compile(checkpointer=memory, interrupt_before=["process_confirmation"])
 
-
-# --- Tenant Graph ---
-tenant_tools = [GetMyLedger]
-tenant_llm = llm.bind_tools(tenant_tools)
-
-def tenant_agent_node(state: AgentState):
-    messages = state["messages"]
-    system_prompt = SystemMessage(content="You are a helpful property management assistant for tenants. Answer queries strictly using the provided tools. Explain ledgers clearly in conversational Hinglish/Hindi. You are read-only and cannot modify data.")
-    msg_history = [system_prompt] + messages[-70:]
-    response = tenant_llm.invoke(msg_history)
-    return {"messages": [response]}
-
-def should_continue_tenant(state: AgentState) -> Literal["tools", END]:
-    messages = state["messages"]
-    last_message = messages[-1]
-    if last_message.tool_calls:
-        return "tools"
-    return END
-
-# Build Tenant Graph
-tenant_workflow = StateGraph(AgentState)
-tenant_workflow.add_node("agent", tenant_agent_node)
-tenant_workflow.add_node("tools", ToolNode(tenant_tools))
-
-tenant_workflow.add_edge(START, "agent")
-tenant_workflow.add_conditional_edges("agent", should_continue_tenant)
-tenant_workflow.add_edge("tools", "agent")
-
-tenant_graph = tenant_workflow.compile(checkpointer=memory)
-
-async def run_admin_agent(sender_id: str, text: str, thread_id: str):
-    """Run the admin agent for a given input."""
+async def run_admin_agent(sender_id: str, text: str, thread_id: str, tenant_context: str = ""):
     config = {"configurable": {"thread_id": thread_id}}
 
-    # Check if graph is paused
     state = admin_graph.get_state(config)
 
-    if state and state.next and "tools" in state.next:
-        # We are paused waiting for approval
-        if text.strip().lower() == "approve":
-            # Resume graph execution
-            send_whatsapp_text(sender_id, "Action approved. Executing...")
-            result = admin_graph.invoke(None, config=config)
+    if state and state.next and "process_confirmation" in state.next:
+        # We are paused, waiting for YES/NO from user
+        admin_graph.update_state(config, {"messages": [HumanMessage(content=text)]}, as_node="ask_confirmation")
 
-            # Send final response
-            final_msg = result["messages"][-1].content
-            if final_msg:
-                send_whatsapp_text(sender_id, final_msg)
+        # Resume the graph from process_confirmation
+        result = admin_graph.invoke(None, config=config)
 
-            # Note: At this point, we'd trigger the HF Manim worker if a transaction was logged.
-            # (In a full implementation, you'd inspect the executed tool outputs here or in the node)
-        else:
-            send_whatsapp_text(sender_id, "Action not approved. Please reply 'approve' or start a new query.")
+        final_msg = result["messages"][-1]
+        if isinstance(final_msg, AIMessage) and final_msg.content:
+            send_whatsapp_text(sender_id, final_msg.content)
+
     else:
         # Normal execution
         inputs = {
             "messages": [HumanMessage(content=text)],
             "sender_id": sender_id,
-            "tenant_id": 0 # Admin doesn't have a tenant ID
+            "tenant_context": tenant_context
         }
 
         result = admin_graph.invoke(inputs, config=config)
 
-        # Check if we hit an interrupt
         new_state = admin_graph.get_state(config)
-        if new_state.next and "tools" in new_state.next:
-            # We hit an interrupt, ask_human_approval node handles the WhatsApp message
+        if new_state.next and "process_confirmation" in new_state.next:
+            # We hit an interrupt, the ask_confirmation node already sent the message
             pass
         else:
-            # Agent finished without interrupt
-            final_msg = result["messages"][-1].content
-            if final_msg:
-                send_whatsapp_text(sender_id, final_msg)
+            final_msg = result["messages"][-1]
+            if isinstance(final_msg, AIMessage) and final_msg.content:
+                send_whatsapp_text(sender_id, final_msg.content)
 
-
-async def run_tenant_agent(sender_id: str, tenant_id: int, text: str, thread_id: str):
-    """Run the read-only tenant agent."""
-    config = {"configurable": {"thread_id": thread_id}}
-
-    inputs = {
-        "messages": [HumanMessage(content=text)],
-        "sender_id": sender_id,
-        "tenant_id": tenant_id
-    }
-
-    result = tenant_graph.invoke(inputs, config=config)
-
-    final_msg = result["messages"][-1].content
-    if final_msg:
-        send_whatsapp_text(sender_id, final_msg)
